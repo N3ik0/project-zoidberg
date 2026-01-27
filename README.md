@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/zoidberg_logo.svg" width="100" height="100" alt="Zoidberg Logo">
+  <img src="assets/icons/zoidberg_logo.svg" width="100" height="100" alt="Zoidberg Logo">
   <h1>Project Zoidberg: Pneumonia Classification</h1>
 </div>
 
