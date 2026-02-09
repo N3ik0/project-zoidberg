@@ -2,6 +2,7 @@ import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader
 from src.data_loader import Lungdataset
+from src.model import get_model
 
 def main():
     # 1. Définition de la "recette"
@@ -29,6 +30,18 @@ def main():
     images, labels = next(iter(train_loader))
     print(f"Forme du batch d'images : {images.shape}")
     print(f"Labels du batch : {labels}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Travail sur {device}")
+
+    #Initialisation du model
+    model = get_model(num_classes=3)
+    model = model.to(device)
+    
+    # On envoi le batch de test sur le gpu
+    images = images.to(device)
+    output = model(images)
+    print(f"Forme de la sortie : {output.shape}")
 
 if __name__ == "__main__":
     main()
