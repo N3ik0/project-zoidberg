@@ -44,6 +44,8 @@ project-zoidberg/
 ├── data/                  # Data folder (Empty in this repo)
 │   └── raw/               # Expected location for raw X-Ray images
 │
+├── models/                # Data folder (for saving models)
+│
 ├── src/                   # Source code
 │   ├── __init__.py
 │   ├── data_loader.py     # Scans directories and assigns labels (0, 1, 2)
