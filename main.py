@@ -3,6 +3,9 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from src.data_loader import Lungdataset
 from src.model import get_model
+import torch.optim as optim
+import torch.nn as nn
+from src.train import train_one_epoch
 
 def main():
     # 1. Définition de la "recette"
@@ -42,6 +45,25 @@ def main():
     images = images.to(device)
     output = model(images)
     print(f"Forme de la sortie : {output.shape}")
+
+    #Loss function
+    criterion = nn.CrossEntropyLoss()
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    best_val_loss = float('inf')
+    for epoch in range(50):
+        train_loss = train_one_epoch(model, train_loader, criterion, device)
+        val_loss = validate(model, val_loader, criterion, device)
+
+        #Sauvegarde du model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dic(), 'models/best_model.pth')
+        
+        early_stopper(val_loss)
+        if early_stopper.early_stop:
+            break
 
 if __name__ == "__main__":
     main()
