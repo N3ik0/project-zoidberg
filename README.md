@@ -4,7 +4,7 @@
 </div>
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-orange)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Status](https://img.shields.io/badge/Status-Academic%20Project-lightgrey)
 
@@ -25,33 +25,93 @@ To run this project, you would need to structure your own dataset as described i
 
 ## Architecture & Methodology
 
-The project implements a **Transfer Learning** approach to achieve high accuracy with limited computational resources.
+The project implements a **Transfer Learning** approach combined with **ensemble learning** to achieve high accuracy and reduce false positives.
 
-* **Model:** ResNet50V2 (Pre-trained on ImageNet).
-* **Strategy:** Fine-tuning. The convolutional base is frozen, and a custom classification head is trained for the 3 specific classes.
-* **Preprocessing:**
-    * Custom `Loader` class to parse file paths and extract labels from filenames.
-    * Pandas DataFrame management for dataset split.
-    * Keras `ImageDataGenerator` for rescaling (pixel normalization) and batching.
+* **Models:** 3 architectures pré-entraînées sur ImageNet :
+  * **DenseNet121** — Standard en imagerie médicale (CheXNet), capture les textures fines
+  * **EfficientNet-B0** — Excellent ratio performance/taille, résistant à l'overfitting
+  * **ResNet50** — Connexions résiduelles, capture les patterns globaux
+* **Strategy:** Fine-tuning avec socle gelé + tête personnalisée (Dropout + Linear)
+* **Ensemble:** Soft voting (moyenne des probabilités softmax) pour un diagnostic plus fiable
+* **Data Augmentation:** Rotation, flip horizontal, color jitter, affine transforms
 
 ## Project Structure
 
-The project follows a modular architecture to separate concerns (Data Loading vs. Preprocessing vs. Modeling).
-
 ```text
 project-zoidberg/
-│
-├── data/                  # Data folder (Empty in this repo)
-│   └── raw/               # Expected location for raw X-Ray images
-│
-├── models/                # Data folder (for saving models)
-│
-├── src/                   # Source code
-│   ├── __init__.py
-│   ├── data_loader.py     # Scans directories and assigns labels (0, 1, 2)
-│   ├── preprocessing.py   # Keras Generators & Normalization
-│   └── model.py           # ResNet50V2 architecture definition
-│
-├── main.py                # Orchestrator: Runs the training pipeline
-├── requirements.txt       # List of dependencies
-└── README.md              # Project documentation
+├── main.py                        # CLI : entraînement & évaluation
+├── predict.py                     # Prédiction ensemble sur une image
+├── data/
+│   └── raw/
+│       ├── train/                 # Images d'entraînement
+│       │   ├── NORMAL/
+│       │   └── PNEUMONIA/         # virus* → Viral, bacteria* → Bactérien
+│       └── test/                  # Images de validation
+├── models/                        # Poids sauvegardés (.pth)
+├── src/
+│   ├── data/                      # Chargement & transforms
+│   │   ├── loader.py              # Lungdataset (scan récursif + labeling)
+│   │   └── augmentation.py        # Train/Val transforms (ImageNet norm)
+│   ├── models/                    # Architectures & ensemble
+│   │   ├── registry.py            # MODEL_REGISTRY + get_model()
+│   │   └── ensemble.py            # EnsemblePredictor (soft voting)
+│   └── training/                  # Boucle d'entraînement & évaluation
+│       ├── trainer.py             # train_one_epoch, validate, EarlyStopper
+│       └── evaluate.py            # Métriques cliniques (confusion, F1, etc.)
+└── README.md
+```
+
+## 🚀 Usage
+
+### Prérequis
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Entraînement
+
+```bash
+# Entraîner les 3 modèles (défaut)
+python main.py train
+
+# Entraîner un modèle spécifique
+python main.py train --models resnet50
+
+# Entraîner une sélection
+python main.py train --models resnet50 densenet121
+```
+
+Modèles disponibles : `resnet50`, `densenet121`, `efficientnet_b0`, `all`
+
+Chaque modèle est sauvegardé dans `models/` uniquement s'il bat le score précédent. L'entraînement s'arrête automatiquement si la validation loss ne s'améliore plus (Early Stopping, patience = 7).
+
+### Évaluation
+
+```bash
+# Évaluer tous les modèles sauvegardés + l'ensemble
+python main.py evaluate
+```
+
+Affiche pour chaque modèle : accuracy, matrice de confusion, precision/recall/F1 par classe. Puis évalue l'ensemble par soft voting.
+
+### Prédiction
+
+```bash
+# Prédiction sur une image unique
+python predict.py --image path/to/xray.png
+
+# Prédiction sur un dossier entier
+python predict.py --dir data/raw/test/NORMAL
+
+# Prédiction sur N images aléatoires d'un dossier (récursif)
+python predict.py --dir data/raw/test --sample 20
+
+# Avec un seuil de confiance personnalisé
+python predict.py --dir data/raw/test --sample 10 --threshold 0.8
+```
+
+- **Mode image** : affiche le diagnostic de chaque modèle + le diagnostic ensemble avec probabilités
+- **Mode batch** : affiche un tableau récapitulatif avec la distribution par classe, le taux de fiabilité et le consensus moyen
