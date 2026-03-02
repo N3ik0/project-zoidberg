@@ -18,10 +18,6 @@ def _build_densenet121(num_classes):
     """
     model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
 
-    # Gel du socle
-    for param in model.features.parameters():
-        param.requires_grad = False
-
     # Remplacement du classifieur (in_features = 1024 pour DenseNet121)
     num_ftrs = model.classifier.in_features
     model.classifier = nn.Sequential(

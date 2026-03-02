@@ -102,7 +102,7 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
     print(f"  Params : {trainable:,} entraînables / {total:,} total ({trainable/total*100:.1f}%)")
 
     criterion = nn.CrossEntropyLoss(
-        weight=class_weights.to(device),
+        #weight=class_weights.to(device),
         label_smoothing=LABEL_SMOOTHING,
     )
     optimizer = optim.Adam(
