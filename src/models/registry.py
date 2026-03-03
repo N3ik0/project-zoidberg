@@ -34,10 +34,6 @@ def _build_efficientnet_b0(num_classes):
     """
     model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
 
-    # Gel du socle
-    for param in model.features.parameters():
-        param.requires_grad = False
-
     # Remplacement du classifieur (in_features = 1280 pour EfficientNet-B0)
     num_ftrs = model.classifier[1].in_features
     model.classifier = nn.Sequential(
@@ -53,11 +49,6 @@ def _build_resnet50(num_classes):
     Capture les patterns globaux de la radiographie.
     """
     model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-
-    # Gel du socle (tout sauf la couche fc)
-    for name, param in model.named_parameters():
-        if "fc" not in name:
-            param.requires_grad = False
 
     # Remplacement de la couche fc
     num_ftrs = model.fc.in_features
