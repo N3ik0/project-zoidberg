@@ -14,8 +14,8 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.data import Lungdataset, get_train_transforms, get_val_transforms
 from src.models import get_model, MODEL_REGISTRY, EnsemblePredictor
@@ -28,10 +28,10 @@ NUM_CLASSES = 3
 BATCH_SIZE = 16 
 LR = 1e-5
 EPOCHS = 50
-PATIENCE = 10 
+PATIENCE = 15 
 LABEL_SMOOTHING = 0.05 
 GRAD_ACCUM_STEPS = 2
-MIXUP_ALPHA = 0.5 
+MIXUP_ALPHA = 0.2
 MODELS_DIR = "models"
 TRAIN_DIR = "data/raw/train"
 VAL_DIR = "data/raw/test"
@@ -101,18 +101,20 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
     total = sum(p.numel() for p in model.parameters())
     print(f"  Params : {trainable:,} entraînables / {total:,} total ({trainable/total*100:.1f}%)")
 
-    criterion = nn.CrossEntropyLoss(
-        #weight=class_weights.to(device),
-        label_smoothing=LABEL_SMOOTHING,
-    )
+    # Augmentation du poids de la classe "Normal" (index 0)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+
     optimizer = optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR,
     )
 
-    # LR Scheduler : réduit le LR quand la val_loss stagne
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+    # LR Scheduler : OneCycleLR
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=LR * 10,
+        epochs=EPOCHS,
+        steps_per_epoch=len(train_loader)
     )
 
     model_path = os.path.join(MODELS_DIR, f"{name}.pth")
@@ -139,13 +141,11 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
             model, train_loader, criterion, optimizer, device,
             use_mixup=True, mixup_alpha=MIXUP_ALPHA,
             grad_accum_steps=GRAD_ACCUM_STEPS,
+            scheduler=scheduler
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
 
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
-
-        # LR Scheduler step
-        scheduler.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -172,14 +172,17 @@ def setup():
     train_ds = Lungdataset(root_dir=TRAIN_DIR, transform=get_train_transforms())
     val_ds = Lungdataset(root_dir=VAL_DIR, transform=get_val_transforms())
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    class_weights = compute_class_weights(train_ds)
+    print(f"Poids de classe : {class_weights.tolist()}")
+
+    sample_weights = [class_weights[label].item() for _, label in train_ds.samples]
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     print(f"\nDataset train : {len(train_ds)} images")
     print(f"Dataset val   : {len(val_ds)} images")
-
-    class_weights = compute_class_weights(train_ds)
-    print(f"Poids de classe : {class_weights.tolist()}")
 
     return device, train_loader, val_loader, train_ds, val_ds, class_weights
 

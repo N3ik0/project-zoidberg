@@ -12,17 +12,19 @@ from torchvision import models
 
 
 def _build_densenet121(num_classes):
-    """
-    DenseNet121 : standard en imagerie médicale (CheXNet).
-    Connexions denses → capture les textures fines (verre dépoli, opacités).
-    """
     model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
-
-    # Remplacement du classifieur (in_features = 1024 pour DenseNet121)
+    
+    # Au lieu de tout geler, dégelez le dernier bloc (features.denseblock4)
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    for param in model.features.denseblock4.parameters():
+        param.requires_grad = True
+        
     num_ftrs = model.classifier.in_features
     model.classifier = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(num_ftrs, num_classes),
+        nn.Dropout(0.4),
+        nn.Linear(num_ftrs, num_classes)
     )
     return model
 
@@ -33,6 +35,14 @@ def _build_efficientnet_b0(num_classes):
     Bon généralisateur, résistant à l'overfitting.
     """
     model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+
+    # Dégel partiel : geler l'essentiel du modèle
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # Dégeler les dernières couches de features (ex: features[-2:])
+    for param in model.features[-2:].parameters():
+        param.requires_grad = True
 
     # Remplacement du classifieur (in_features = 1280 pour EfficientNet-B0)
     num_ftrs = model.classifier[1].in_features
@@ -49,6 +59,14 @@ def _build_resnet50(num_classes):
     Capture les patterns globaux de la radiographie.
     """
     model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+
+    # Dégel partiel : geler l'essentiel du modèle
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # Dégeler le dernier bloc (layer4)
+    for param in model.layer4.parameters():
+        param.requires_grad = True
 
     # Remplacement de la couche fc
     num_ftrs = model.fc.in_features

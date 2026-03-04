@@ -40,7 +40,7 @@ def mixup_criterion(criterion, outputs, labels_a, labels_b, lam):
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device,
-                    use_mixup=True, mixup_alpha=0.4, grad_accum_steps=1):
+                    use_mixup=True, mixup_alpha=0.4, grad_accum_steps=1, scheduler=None):
     """
     Entraîne le modèle sur un epoch complet.
 
@@ -76,6 +76,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
 
         if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(loader):
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
 
         running_loss += loss.item() * grad_accum_steps  # Compenser la division
