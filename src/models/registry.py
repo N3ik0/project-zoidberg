@@ -41,7 +41,8 @@ def _build_efficientnet_b0(num_classes):
         param.requires_grad = False
         
     # Dégeler les dernières couches de features (ex: features[-2:])
-    for param in model.features[-2:].parameters():
+
+    for param in model.features[-4:].parameters():
         param.requires_grad = True
 
     # Remplacement du classifieur (in_features = 1280 pour EfficientNet-B0)
@@ -60,18 +61,18 @@ def _build_resnet50(num_classes):
     """
     model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
 
-    # Dégel partiel : geler l'essentiel du modèle
+    # Geler tout le backbone
     for param in model.parameters():
         param.requires_grad = False
         
-    # Dégeler le dernier bloc (layer4)
-    for param in model.layer4[-1].parameters():
-        param.require_grad = True
+    # Dégeler tout layer4 (3 Bottleneck blocks)
+    for param in model.layer4.parameters():
+        param.requires_grad = True
 
     # Remplacement de la couche fc
     num_ftrs = model.fc.in_features
     model.fc = nn.Sequential(
-        nn.Dropout(0.3),
+        nn.Dropout(0.5),
         nn.Linear(num_ftrs, num_classes),
     )
     return model

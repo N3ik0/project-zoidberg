@@ -13,6 +13,7 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -73,26 +74,16 @@ def resolve_model_names(selection):
 def train_single_model(name, train_loader, val_loader, class_weights, device):
     """
     Entraîne un seul modèle avec :
-    - Label smoothing
-    - Mixup data augmentation
+    - Focal Loss
+    - Pas de Mixup (désactivé pour l'imagerie fine)
     - Gradient accumulation
-    - ReduceLROnPlateau scheduler
-
-    Args:
-        name: Nom du modèle (clé du registre)
-        train_loader: DataLoader d'entraînement
-        val_loader: DataLoader de validation
-        class_weights: Tensor de poids pour la loss
-        device: Device (cuda/cpu)
-
-    Returns:
-        Chemin vers le fichier de poids sauvegardé
+    - OneCycleLR scheduler
     """
     print(f"\n{'='*50}")
     print(f"  ENTRAÎNEMENT : {name.upper()}")
     print(f"{'='*50}")
     print(f"  Config : BS={BATCH_SIZE} | LR={LR} | Label Smooth={LABEL_SMOOTHING}")
-    print(f"           Mixup α={MIXUP_ALPHA} | Grad Accum={GRAD_ACCUM_STEPS}")
+    print(f"           Mixup α={MIXUP_ALPHA} (Désactivé) | Grad Accum={GRAD_ACCUM_STEPS}")
 
     model = get_model(name, num_classes=NUM_CLASSES).to(device)
 
@@ -101,24 +92,27 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
     total = sum(p.numel() for p in model.parameters())
     print(f"  Params : {trainable:,} entraînables / {total:,} total ({trainable/total*100:.1f}%)")
 
-    # Augmentation du poids de la classe "Normal" (index 0)
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     optimizer = optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR,
+        weight_decay=1e-4,
     )
 
     # LR Scheduler : OneCycleLR
     scheduler = OneCycleLR(
         optimizer,
-        max_lr=LR * 10,
+        max_lr=LR * 3,
         epochs=EPOCHS,
         steps_per_epoch=len(train_loader)
     )
 
     model_path = os.path.join(MODELS_DIR, f"{name}.pth")
-    best_val_loss = float("inf")
+    
+    # --- CORRECTION DE LA SAUVEGARDE (TRACKING DE L'ACCURACY) ---
+    best_val_acc = 0.0
+    best_val_loss = float("inf") # Uniquement utilisé pour l'Early Stopping
 
     # Si un précédent modèle existe, on récupère son score comme baseline
     if os.path.exists(model_path):
@@ -127,8 +121,9 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
             torch.load(model_path, map_location=device, weights_only=True)
         )
         prev_val_loss, prev_acc = validate(prev_model, val_loader, criterion, device)
+        best_val_acc = prev_acc
         best_val_loss = prev_val_loss
-        print(f"  Score à battre → Val Loss: {best_val_loss:.4f} | Acc: {prev_acc*100:.2f}%")
+        print(f"  Score à battre → Val Acc: {best_val_acc*100:.2f}% | (Loss: {prev_val_loss:.4f})")
         del prev_model
 
     early_stopper = EarlyStopper(patience=PATIENCE)
@@ -139,7 +134,7 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            use_mixup=False, mixup_alpha=MIXUP_ALPHA,
+            use_mixup=False, mixup_alpha=MIXUP_ALPHA,  # Mixup est bien en False
             grad_accum_steps=GRAD_ACCUM_STEPS,
             scheduler=scheduler
         )
@@ -147,12 +142,11 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
 
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
 
-
+        # Sauvegarde basée UNIQUEMENT sur l'amélioration de l'Accuracy
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), model_path)
-            print(f"  🌟 Nouveau record ! Sauvegardé dans {model_path}")
-
+            print(f"  🌟 Nouveau record ! Sauvegardé dans {model_path} (Acc: {best_val_acc*100:.2f}%)")
 
         early_stopper(val_loss)
         if early_stopper.early_stop:
