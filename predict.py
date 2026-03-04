@@ -65,6 +65,11 @@ def parse_args():
         default=0.7,
         help="Seuil de confiance (défaut: 0.7)",
     )
+    parser.add_argument(
+        "--strict-pneumonia",
+        action="store_true",
+        help="Favorise le diagnostic Normal (réduit les faux positifs de Pneumonie)",
+    )
     return parser.parse_args()
 
 
@@ -97,30 +102,38 @@ def collect_images(dir_path, sample_n=None, seed=42):
     return sorted(images)
 
 
-def predict_single(model, image_tensor, device, threshold=0.7):
+def predict_single(model, image_tensor, device, threshold=0.7, strict_pneumonia=False):
     """
     Prédit la classe d'une image avec un seul modèle.
 
     Returns:
         dict avec classe, probas, confiance, fiable
     """
+    import numpy as np
+
     model.eval()
     image_tensor = image_tensor.to(device)
 
     with torch.no_grad():
         output = model(image_tensor)
-        probas = F.softmax(output, dim=1)
-        confiance, classe = torch.max(probas, dim=1)
+        probas = F.softmax(output, dim=1).squeeze().cpu().numpy()
+
+    if strict_pneumonia:
+        probas[0] *= 1.2
+        probas /= probas.sum()  # Renormalisation
+
+    classe = int(np.argmax(probas))
+    confiance = float(probas[classe])
 
     return {
-        "classe": classe.item(),
-        "probas": probas.squeeze().cpu().tolist(),
-        "confiance": confiance.item(),
-        "fiable": confiance.item() >= threshold,
+        "classe": classe,
+        "probas": probas.tolist(),
+        "confiance": confiance,
+        "fiable": confiance >= threshold,
     }
 
 
-def predict_tta(model, image_pil, tta_transforms, device, threshold=0.7):
+def predict_tta(model, image_pil, tta_transforms, device, threshold=0.7, strict_pneumonia=False):
     """
     Prédit avec Test-Time Augmentation : applique N transforms différentes
     et moyenne les probabilités pour un résultat plus robuste.
@@ -138,6 +151,11 @@ def predict_tta(model, image_pil, tta_transforms, device, threshold=0.7):
             all_probas.append(probas.squeeze().cpu().numpy())
 
     mean_probas = np.mean(all_probas, axis=0)
+
+    if strict_pneumonia:
+        mean_probas[0] *= 1.2
+        mean_probas /= mean_probas.sum()
+
     classe = int(np.argmax(mean_probas))
     confiance = float(mean_probas[classe])
 
@@ -275,10 +293,10 @@ def main():
             print(f"TTA    : {args.tta} passes")
             image_pil = Image.open(args.image).convert("RGB")
             tta_transforms = get_tta_transforms(args.tta)
-            result = predict_tta(model, image_pil, tta_transforms, device, args.threshold)
+            result = predict_tta(model, image_pil, tta_transforms, device, args.threshold, args.strict_pneumonia)
         else:
             image_tensor = load_image(args.image)
-            result = predict_single(model, image_tensor, device, args.threshold)
+            result = predict_single(model, image_tensor, device, args.threshold, args.strict_pneumonia)
 
         display_single_result(result, args.image)
 
@@ -295,10 +313,10 @@ def main():
             if args.tta > 1:
                 image_pil = Image.open(str(img_path)).convert("RGB")
                 tta_transforms = get_tta_transforms(args.tta)
-                result = predict_tta(model, image_pil, tta_transforms, device, args.threshold)
+                result = predict_tta(model, image_pil, tta_transforms, device, args.threshold, args.strict_pneumonia)
             else:
                 image_tensor = load_image(str(img_path))
-                result = predict_single(model, image_tensor, device, args.threshold)
+                result = predict_single(model, image_tensor, device, args.threshold, args.strict_pneumonia)
             results.append({"path": str(img_path), "result": result})
 
         display_batch_results(results, args.threshold)

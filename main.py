@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.data import Lungdataset, get_train_transforms, get_val_transforms
@@ -33,6 +34,7 @@ BATCH_SIZE = 16
 EPOCHS = 50
 PATIENCE = 15
 LABEL_SMOOTHING = 0.05
+LABEL_SMOOTHING_MIXUP = 0.01  # LS réduit quand Mixup est actif
 GRAD_ACCUM_STEPS = 2
 MODELS_DIR = "models"
 TRAIN_DIR = "data/raw/train"
@@ -151,6 +153,11 @@ def train_model(name, phase, train_loader, val_loader, class_weights, device):
 
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-7)
 
+    # Configuration SWA
+    SWA_START = EPOCHS - 15 if phase == 2 else float('inf')
+    swa_model = AveragedModel(model) if phase == 2 else None
+    swa_scheduler = SWALR(optimizer, swa_lr=5e-6) if phase == 2 else None
+
     model_path = os.path.join(MODELS_DIR, f"{name}.pth")
     best_val_acc = 0.0
     best_val_loss = float("inf")
@@ -180,15 +187,23 @@ def train_model(name, phase, train_loader, val_loader, class_weights, device):
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"\nEpoch {epoch + 1}/{EPOCHS} (LR: {current_lr:.2e})")
 
+        mixup_active = (phase == 2) and (epoch < EPOCHS // 2)
+        criterion.label_smoothing = LABEL_SMOOTHING_MIXUP if mixup_active else LABEL_SMOOTHING
+
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            use_mixup=(phase == 2),
-            mixup_alpha=MIXUP_ALPHA if phase == 2 else 0.0,
+            use_mixup=mixup_active,
+            mixup_alpha=MIXUP_ALPHA if mixup_active else 0.0,
             grad_accum_steps=GRAD_ACCUM_STEPS,
             scheduler=None  # CosineAnnealingLR step par epoch
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
-        scheduler.step()
+        
+        if phase == 2 and epoch >= SWA_START:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+        else:
+            scheduler.step()
 
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
 
@@ -202,6 +217,19 @@ def train_model(name, phase, train_loader, val_loader, class_weights, device):
         if early_stopper.early_stop:
             print("  ⏹ Early Stopping déclenché.")
             break
+
+    if phase == 2 and epoch >= SWA_START:
+        print("\n🔄 Mise à jour des BatchNorms pour le modèle SWA...")
+        update_bn(train_loader, swa_model, device=device)
+        swa_val_loss, swa_val_acc = validate(swa_model, val_loader, criterion, device)
+        print(f"  SWA Val Loss: {swa_val_loss:.4f} | SWA Val Acc: {swa_val_acc*100:.2f}%")
+        
+        if swa_val_acc > best_val_acc:
+            best_val_acc = swa_val_acc
+            torch.save(swa_model.module.state_dict(), model_path)
+            print(f"  🌟 SWA est le nouveau record ! Sauvegardé dans {model_path} (Acc: {best_val_acc*100:.2f}%)")
+        else:
+            print("  SWA n'a pas battu le meilleur modèle standard.")
 
     return model_path
 
@@ -226,7 +254,8 @@ def setup(seed=DEFAULT_SEED):
     val_ds = Lungdataset(root_dir=VAL_DIR, transform=get_val_transforms())
 
     class_weights = compute_class_weights(train_ds)
-    print(f"Poids de classe : {class_weights.tolist()}")
+    class_weights[0] *= 1.1 # Boost du poids de "Normal" pour réduire les faux positifs pneumonia
+    print(f"Poids de classe (ajustés): {class_weights.tolist()}")
 
     # Générateur déterministe
     g = torch.Generator()
