@@ -55,6 +55,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
         grad_accum_steps: Nombre de steps d'accumulation de gradients
     """
     model.train()
+    
+    # Figer les BatchNorms (les ramener en mode eval même si model.train() a été appelé)
+    for module in model.modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            module.eval()
+
     running_loss = 0.0
     optimizer.zero_grad()
 

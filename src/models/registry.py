@@ -34,13 +34,13 @@ def _build_densenet121(num_classes, phase=1):
     if phase == 2:
         # Dégeler les blocs profonds pour le fine-tuning
         for name, param in model.features.named_parameters():
-            if any(block in name for block in ["denseblock3", "transition3", "denseblock4"]):
+            if any(block in name for block in ["transition3", "denseblock4"]):
                 param.requires_grad = True
 
         # Re-geler les BatchNorm (stats bruitées avec petit batch)
         for name, module in model.features.named_modules():
             if isinstance(module, nn.BatchNorm2d) and any(
-                block in name for block in ["denseblock3", "transition3", "denseblock4"]
+                block in name for block in ["transition3", "denseblock4"]
             ):
                 module.requires_grad_(False)
                 module.eval()  # Utilise les stats ImageNet

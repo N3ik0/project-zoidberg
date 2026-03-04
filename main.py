@@ -41,9 +41,11 @@ DEFAULT_SEED = 42
 
 # Hyperparamètres par phase
 PHASE_CONFIG = {
-    1: {"lr": 1e-3,  "description": "Linear Probing (backbone gelé)"},
-    2: {"lr": 1e-5,  "description": "Fine-Tuning partiel (blocs profonds dégelés)"},
+    1: {"lr_head": 1e-3, "lr_backbone": 0.0,  "description": "Linear Probing (backbone 100% gelé)"},
+    2: {"lr_head": 1e-4, "lr_backbone": 1e-5, "description": "Fine-Tuning partiel (denseblock4 + transition3)"},
 }
+
+MIXUP_ALPHA = 0.2
 
 
 def set_seed(seed):
@@ -102,7 +104,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_model(name, phase, train_loader, val_loader, device):
+def train_model(name, phase, train_loader, val_loader, class_weights, device):
     """
     Entraîne le modèle avec la configuration de la phase spécifiée.
 
@@ -110,13 +112,15 @@ def train_model(name, phase, train_loader, val_loader, device):
     Phase 2 : LR bas (1e-5), blocs profonds dégelés → affinage des features
     """
     config = PHASE_CONFIG[phase]
-    lr = config["lr"]
+    lr_head = config["lr_head"]
+    lr_backbone = config["lr_backbone"]
 
     print(f"\n{'='*60}")
     print(f"  ENTRAÎNEMENT : {name.upper()} — PHASE {phase}")
     print(f"  {config['description']}")
     print(f"{'='*60}")
-    print(f"  Config : BS={BATCH_SIZE} | LR={lr} | Label Smooth={LABEL_SMOOTHING}")
+    print(f"  Config : BS={BATCH_SIZE} | LR Head={lr_head:.1e} | LR Backbone={lr_backbone:.1e}")
+    print(f"           Label Smooth={LABEL_SMOOTHING} | Mixup={MIXUP_ALPHA if phase == 2 else 'Non'}")
     print(f"           Grad Accum={GRAD_ACCUM_STEPS} | Patience={PATIENCE}")
 
     model = get_model(name, num_classes=NUM_CLASSES, phase=phase).to(device)
@@ -126,13 +130,24 @@ def train_model(name, phase, train_loader, val_loader, device):
     total = sum(p.numel() for p in model.parameters())
     print(f"  Params : {trainable:,} entraînables / {total:,} total ({trainable/total*100:.1f}%)")
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    class_weights = class_weights.to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
 
-    optimizer = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        weight_decay=1e-4,
-    )
+    # Séparation des paramètres pour Discriminative LR
+    head_params = []
+    backbone_params = []
+    for p_name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "classifier" in p_name:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    optimizer = optim.Adam([
+        {"params": backbone_params, "lr": lr_backbone},
+        {"params": head_params, "lr": lr_head}
+    ], weight_decay=1e-4)
 
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-7)
 
@@ -167,7 +182,8 @@ def train_model(name, phase, train_loader, val_loader, device):
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            use_mixup=False,
+            use_mixup=(phase == 2),
+            mixup_alpha=MIXUP_ALPHA if phase == 2 else 0.0,
             grad_accum_steps=GRAD_ACCUM_STEPS,
             scheduler=None  # CosineAnnealingLR step par epoch
         )
@@ -237,14 +253,14 @@ def setup(seed=DEFAULT_SEED):
     print(f"\nDataset train : {len(train_ds)} images")
     print(f"Dataset val   : {len(val_ds)} images")
 
-    return device, train_loader, val_loader
+    return device, train_loader, val_loader, class_weights
 
 
-def cmd_train(model_name, phase, train_loader, val_loader, device):
+def cmd_train(model_name, phase, train_loader, val_loader, class_weights, device):
     """Sous-commande train : entraîne puis évalue le modèle."""
     print(f"\n📋 Modèle : {model_name.upper()} | Phase : {phase}")
 
-    model_path = train_model(model_name, phase, train_loader, val_loader, device)
+    model_path = train_model(model_name, phase, train_loader, val_loader, class_weights, device)
 
     # Évaluation après entraînement
     if os.path.exists(model_path):
@@ -295,8 +311,8 @@ def main():
 
         if len(seeds) == 1:
             set_seed(seeds[0])
-            device, train_loader, val_loader = setup(seed=seeds[0])
-            cmd_train(model_name, phase, train_loader, val_loader, device)
+            device, train_loader, val_loader, class_weights = setup(seed=seeds[0])
+            cmd_train(model_name, phase, train_loader, val_loader, class_weights, device)
         else:
             # Mode multi-seed : moyenne ± écart-type
             print(f"\n🔬 Mode multi-seed : {len(seeds)} runs avec seeds {seeds}")
@@ -308,8 +324,8 @@ def main():
                 print(f"{'#'*60}")
 
                 set_seed(seed)
-                device, train_loader, val_loader = setup(seed=seed)
-                cmd_train(model_name, phase, train_loader, val_loader, device)
+                device, train_loader, val_loader, class_weights = setup(seed=seed)
+                cmd_train(model_name, phase, train_loader, val_loader, class_weights, device)
 
                 # Récupérer l'accuracy pour ce run
                 path = os.path.join(MODELS_DIR, f"{model_name}.pth")
@@ -332,7 +348,7 @@ def main():
 
     elif args.command == "evaluate":
         set_seed(DEFAULT_SEED)
-        device, train_loader, val_loader = setup()
+        device, train_loader, val_loader, _ = setup()
         cmd_evaluate(args.model, val_loader, device)
 
 
