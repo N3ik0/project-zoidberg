@@ -1,107 +1,73 @@
 """
-Factory de modèles pré-entraînés.
-Chaque modèle est configuré pour du fine-tuning :
-  - Socle gelé (features ImageNet préservées — optimal pour petit dataset)
-  - Tête personnalisée avec Dropout (régularisation anti-overfitting)
+Factory DenseNet121 avec entraînement en 2 phases (Discriminative Fine-Tuning).
 
-Note : le dégel partiel du backbone nécessite >50K images pour être bénéfique.
-Avec ~5K images, le backbone gelé donne de meilleurs résultats.
+Phase 1 — Linear Probing :
+    Backbone 100% gelé, seul le classifieur est entraîné.
+    Objectif : calibrer la tête de classification sur nos 3 classes.
+
+Phase 2 — Fine-Tuning partiel :
+    Dégèle les blocs profonds (denseblock3, transition3, denseblock4)
+    pour adapter les features de haut niveau aux textures pulmonaires.
+    Les BatchNorm restent gelées pour stabiliser les petits batches.
 """
 import torch.nn as nn
 from torchvision import models
 
 
-def _build_densenet121(num_classes):
+def _build_densenet121(num_classes, phase=1):
+    """
+    Construit un DenseNet121 pré-entraîné configuré selon la phase d'entraînement.
+
+    Args:
+        num_classes: Nombre de classes de sortie (3 : Normal, Viral, Bactérien)
+        phase: 1 = Linear Probing, 2 = Fine-Tuning partiel
+
+    Returns:
+        nn.Module prêt pour l'entraînement
+    """
     model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
-    
-    # Au lieu de tout geler, dégelez le dernier bloc (features.denseblock4)
+
+    # Geler 100% du backbone
     for param in model.parameters():
         param.requires_grad = False
-    
-    for param in model.features.denseblock4.parameters():
-        param.requires_grad = True
-        
+
+    if phase == 2:
+        # Dégeler les blocs profonds pour le fine-tuning
+        for name, param in model.features.named_parameters():
+            if any(block in name for block in ["denseblock3", "transition3", "denseblock4"]):
+                param.requires_grad = True
+
+        # Re-geler les BatchNorm (stats bruitées avec petit batch)
+        for name, module in model.features.named_modules():
+            if isinstance(module, nn.BatchNorm2d) and any(
+                block in name for block in ["denseblock3", "transition3", "denseblock4"]
+            ):
+                module.requires_grad_(False)
+                module.eval()  # Utilise les stats ImageNet
+
+    # Tête de classification personnalisée (toujours entraînable)
     num_ftrs = model.classifier.in_features
     model.classifier = nn.Sequential(
         nn.Dropout(0.4),
         nn.Linear(num_ftrs, num_classes)
     )
+
     return model
 
 
-def _build_efficientnet_b0(num_classes):
+def get_model(name="densenet121", num_classes=3, phase=1):
     """
-    EfficientNet-B0 : excellent ratio performance/taille.
-    Bon généralisateur, résistant à l'overfitting.
-    """
-    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-
-    # Dégel partiel : geler l'essentiel du modèle
-    for param in model.parameters():
-        param.requires_grad = False
-        
-    # Dégeler les dernières couches de features (ex: features[-2:])
-
-    for param in model.features[-4:].parameters():
-        param.requires_grad = True
-
-    # Remplacement du classifieur (in_features = 1280 pour EfficientNet-B0)
-    num_ftrs = model.classifier[1].in_features
-    model.classifier = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(num_ftrs, num_classes),
-    )
-    return model
-
-
-def _build_resnet50(num_classes):
-    """
-    ResNet50 : architecture éprouvée avec connexions résiduelles.
-    Capture les patterns globaux de la radiographie.
-    """
-    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-
-    # Geler tout le backbone
-    for param in model.parameters():
-        param.requires_grad = False
-        
-    # Dégeler tout layer4 (3 Bottleneck blocks)
-    for param in model.layer4.parameters():
-        param.requires_grad = True
-
-    # Remplacement de la couche fc
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(num_ftrs, num_classes),
-    )
-    return model
-
-
-# ---------------------------------------------------------------
-# Registre des modèles disponibles
-# Pour ajouter un nouveau modèle : ajouter une entrée ici.
-# ---------------------------------------------------------------
-MODEL_REGISTRY = {
-    "densenet121": _build_densenet121,
-    "efficientnet_b0": _build_efficientnet_b0,
-    "resnet50": _build_resnet50,
-}
-
-
-def get_model(name, num_classes=3):
-    """
-    Factory : retourne un modèle prêt pour le fine-tuning.
+    Factory : retourne un DenseNet121 configuré pour la phase spécifiée.
 
     Args:
-        name: Clé du registre (ex: "densenet121")
+        name: Nom du modèle (seul "densenet121" est supporté)
         num_classes: Nombre de classes de sortie
+        phase: 1 = Linear Probing, 2 = Fine-Tuning partiel
 
     Returns:
-        nn.Module avec socle gelé et tête personnalisée
+        nn.Module prêt pour l'entraînement
     """
-    if name not in MODEL_REGISTRY:
-        available = ", ".join(MODEL_REGISTRY.keys())
-        raise ValueError(f"Modèle '{name}' inconnu. Disponibles : {available}")
+    if name != "densenet121":
+        raise ValueError(f"Modèle '{name}' non supporté. Seul 'densenet121' est disponible.")
 
-    return MODEL_REGISTRY[name](num_classes)
+    return _build_densenet121(num_classes, phase=phase)

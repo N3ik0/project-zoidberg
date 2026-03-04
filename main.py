@@ -1,91 +1,125 @@
 """
-Orchestrateur principal.
-Entraîne séquentiellement les modèles de l'ensemble,
-puis évalue chaque modèle + l'ensemble combiné.
+Orchestrateur principal — DenseNet121 avec entraînement 2-phases.
+
+Phase 1 (Linear Probing) : Backbone gelé, seul le classifieur s'entraîne.
+Phase 2 (Fine-Tuning)    : Dégel des blocs profonds pour affiner les features.
 
 Usage :
-    python main.py train                           # Entraîne les 3 modèles
-    python main.py train --models resnet50         # Entraîne un seul modèle
-    python main.py train --models resnet50 densenet121  # Sélection multiple
-    python main.py evaluate                        # Évalue les modèles sauvegardés
+    python main.py train                          # Phase 1 par défaut
+    python main.py train --phase 2                # Fine-tuning partiel
+    python main.py train --phase 1 --seed 42      # Reproductible
+    python main.py train --seed 42 123 456        # Multi-seed → moyenne ± std
+    python main.py evaluate                       # Évalue le modèle sauvegardé
 """
 import os
+import random
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.data import Lungdataset, get_train_transforms, get_val_transforms
-from src.models import get_model, MODEL_REGISTRY, EnsemblePredictor
+from src.models import get_model
 from src.training import train_one_epoch, validate, EarlyStopper, evaluate_model, compute_class_weights
 
 # ---------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------
 NUM_CLASSES = 3
-BATCH_SIZE = 16 
-LR = 1e-5
+BATCH_SIZE = 16
 EPOCHS = 50
-PATIENCE = 15 
-LABEL_SMOOTHING = 0.05 
+PATIENCE = 15
+LABEL_SMOOTHING = 0.05
 GRAD_ACCUM_STEPS = 2
-MIXUP_ALPHA = 0.2
 MODELS_DIR = "models"
 TRAIN_DIR = "data/raw/train"
 VAL_DIR = "data/raw/test"
+DEFAULT_SEED = 42
+
+# Hyperparamètres par phase
+PHASE_CONFIG = {
+    1: {"lr": 1e-3,  "description": "Linear Probing (backbone gelé)"},
+    2: {"lr": 1e-5,  "description": "Fine-Tuning partiel (blocs profonds dégelés)"},
+}
+
+
+def set_seed(seed):
+    """
+    Fixe toutes les sources d'aléatoire pour une reproductibilité totale.
+    Même seed → mêmes batchs, même ordre, mêmes augmentations.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"🔒 Seed fixée : {seed} (mode déterministe)")
 
 
 def parse_args():
     """Parse les arguments CLI."""
     parser = argparse.ArgumentParser(
-        description="Pipeline d'entraînement et d'évaluation multi-modèles"
+        description="Pipeline d'entraînement DenseNet121 — 2 phases"
     )
     subparsers = parser.add_subparsers(dest="command", help="Commande à exécuter")
 
     # -- train --
-    train_parser = subparsers.add_parser("train", help="Entraîner un ou plusieurs modèles")
+    train_parser = subparsers.add_parser("train", help="Entraîner le modèle")
     train_parser.add_argument(
-        "--models",
+        "--model",
+        type=str,
+        default="densenet121",
+        help="Modèle à entraîner (défaut: densenet121)",
+    )
+    train_parser.add_argument(
+        "--phase",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="Phase d'entraînement : 1=Linear Probing, 2=Fine-Tuning (défaut: 1)",
+    )
+    train_parser.add_argument(
+        "--seed",
         nargs="+",
-        choices=list(MODEL_REGISTRY.keys()) + ["all"],
-        default=["all"],
-        help="Modèle(s) à entraîner (défaut: all)",
+        type=int,
+        default=[DEFAULT_SEED],
+        help="Seed(s) pour la reproductibilité (défaut: 42). Plusieurs seeds → moyenne ± std.",
     )
 
     # -- evaluate --
-    subparsers.add_parser("evaluate", help="Évaluer les modèles sauvegardés + ensemble")
+    eval_parser = subparsers.add_parser("evaluate", help="Évaluer le modèle sauvegardé")
+    eval_parser.add_argument(
+        "--model",
+        type=str,
+        default="densenet121",
+        help="Modèle à évaluer (défaut: densenet121)",
+    )
 
     return parser.parse_args()
 
 
-def resolve_model_names(selection):
+def train_model(name, phase, train_loader, val_loader, device):
     """
-    Résout la sélection de modèles.
-    Si 'all' est présent, retourne tous les modèles du registre.
-    """
-    if "all" in selection:
-        return list(MODEL_REGISTRY.keys())
-    return selection
+    Entraîne le modèle avec la configuration de la phase spécifiée.
 
-
-def train_single_model(name, train_loader, val_loader, class_weights, device):
+    Phase 1 : LR élevé (1e-3), backbone gelé → convergence rapide du classifieur
+    Phase 2 : LR bas (1e-5), blocs profonds dégelés → affinage des features
     """
-    Entraîne un seul modèle avec :
-    - Focal Loss
-    - Pas de Mixup (désactivé pour l'imagerie fine)
-    - Gradient accumulation
-    - OneCycleLR scheduler
-    """
-    print(f"\n{'='*50}")
-    print(f"  ENTRAÎNEMENT : {name.upper()}")
-    print(f"{'='*50}")
-    print(f"  Config : BS={BATCH_SIZE} | LR={LR} | Label Smooth={LABEL_SMOOTHING}")
-    print(f"           Mixup α={MIXUP_ALPHA} (Désactivé) | Grad Accum={GRAD_ACCUM_STEPS}")
+    config = PHASE_CONFIG[phase]
+    lr = config["lr"]
 
-    model = get_model(name, num_classes=NUM_CLASSES).to(device)
+    print(f"\n{'='*60}")
+    print(f"  ENTRAÎNEMENT : {name.upper()} — PHASE {phase}")
+    print(f"  {config['description']}")
+    print(f"{'='*60}")
+    print(f"  Config : BS={BATCH_SIZE} | LR={lr} | Label Smooth={LABEL_SMOOTHING}")
+    print(f"           Grad Accum={GRAD_ACCUM_STEPS} | Patience={PATIENCE}")
+
+    model = get_model(name, num_classes=NUM_CLASSES, phase=phase).to(device)
 
     # Comptage des paramètres entraînables
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -96,27 +130,19 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
 
     optimizer = optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=LR,
+        lr=lr,
         weight_decay=1e-4,
     )
 
-    # LR Scheduler : OneCycleLR
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=LR * 3,
-        epochs=EPOCHS,
-        steps_per_epoch=len(train_loader)
-    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-7)
 
     model_path = os.path.join(MODELS_DIR, f"{name}.pth")
-    
-    # --- CORRECTION DE LA SAUVEGARDE (TRACKING DE L'ACCURACY) ---
     best_val_acc = 0.0
-    best_val_loss = float("inf") # Uniquement utilisé pour l'Early Stopping
+    best_val_loss = float("inf")
 
     # Si un précédent modèle existe, on récupère son score comme baseline
     if os.path.exists(model_path):
-        prev_model = get_model(name, num_classes=NUM_CLASSES).to(device)
+        prev_model = get_model(name, num_classes=NUM_CLASSES, phase=phase).to(device)
         prev_model.load_state_dict(
             torch.load(model_path, map_location=device, weights_only=True)
         )
@@ -126,6 +152,13 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
         print(f"  Score à battre → Val Acc: {best_val_acc*100:.2f}% | (Loss: {prev_val_loss:.4f})")
         del prev_model
 
+        # En phase 2, charger les poids de la phase 1 comme point de départ
+        if phase == 2:
+            model.load_state_dict(
+                torch.load(model_path, map_location=device, weights_only=True)
+            )
+            print(f"  📦 Poids de la Phase 1 chargés comme point de départ")
+
     early_stopper = EarlyStopper(patience=PATIENCE)
 
     for epoch in range(EPOCHS):
@@ -134,15 +167,16 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            use_mixup=False, mixup_alpha=MIXUP_ALPHA,  # Mixup est bien en False
+            use_mixup=False,
             grad_accum_steps=GRAD_ACCUM_STEPS,
-            scheduler=scheduler
+            scheduler=None  # CosineAnnealingLR step par epoch
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
+        scheduler.step()
 
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
 
-        # Sauvegarde basée UNIQUEMENT sur l'amélioration de l'Accuracy
+        # Sauvegarde basée sur l'amélioration de l'Accuracy
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), model_path)
@@ -156,8 +190,15 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
     return model_path
 
 
-def setup():
-    """Prépare le device, les datasets et les DataLoaders."""
+def _seed_worker(worker_id):
+    """Assure que chaque worker DataLoader utilise un seed déterministe."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def setup(seed=DEFAULT_SEED):
+    """Prépare le device, les datasets et les DataLoaders (déterministe)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
     if device.type == "cuda":
@@ -171,136 +212,69 @@ def setup():
     class_weights = compute_class_weights(train_ds)
     print(f"Poids de classe : {class_weights.tolist()}")
 
-    sample_weights = [class_weights[label].item() for _, label in train_ds.samples]
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    # Générateur déterministe
+    g = torch.Generator()
+    g.manual_seed(seed)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    sample_weights = [class_weights[label].item() for _, label in train_ds.samples]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+        generator=g
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, sampler=sampler,
+        num_workers=4, pin_memory=True,
+        worker_init_fn=_seed_worker, generator=g
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=4, pin_memory=True
+    )
 
     print(f"\nDataset train : {len(train_ds)} images")
     print(f"Dataset val   : {len(val_ds)} images")
 
-    return device, train_loader, val_loader, train_ds, val_ds, class_weights
+    return device, train_loader, val_loader
 
 
-def cmd_train(model_names, train_loader, val_loader, class_weights, device):
-    """Sous-commande train : entraîne les modèles sélectionnés."""
-    print(f"\nModèles à entraîner : {', '.join(m.upper() for m in model_names)}")
+def cmd_train(model_name, phase, train_loader, val_loader, device):
+    """Sous-commande train : entraîne puis évalue le modèle."""
+    print(f"\n📋 Modèle : {model_name.upper()} | Phase : {phase}")
 
-    saved_paths = {}
-    for name in model_names:
-        path = train_single_model(name, train_loader, val_loader, class_weights, device)
-        saved_paths[name] = path
+    model_path = train_model(model_name, phase, train_loader, val_loader, device)
 
-    # Évaluation individuelle après entraînement
-    print(f"\n{'='*50}")
-    print(f"  ÉVALUATION INDIVIDUELLE")
-    print(f"{'='*50}")
+    # Évaluation après entraînement
+    if os.path.exists(model_path):
+        print(f"\n{'='*60}")
+        print(f"  ÉVALUATION — {model_name.upper()}")
+        print(f"{'='*60}")
 
-    accuracies = {}
-    for name, path in saved_paths.items():
-        if os.path.exists(path):
-            print(f"\n--- {name.upper()} ---")
-            model = get_model(name, num_classes=NUM_CLASSES).to(device)
-            model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-            result = evaluate_model(model, val_loader, device, model_name=name)
-            accuracies[name] = result["accuracy"]
-            del model
-
-    # Si tous les modèles sont entraînés, évaluer l'ensemble
-    all_model_paths = {
-        name: os.path.join(MODELS_DIR, f"{name}.pth")
-        for name in MODEL_REGISTRY.keys()
-    }
-    available = {n: p for n, p in all_model_paths.items() if os.path.exists(p)}
-
-    if len(available) > 1:
-        _evaluate_ensemble(available, val_loader, device, accuracies)
-
-
-def cmd_evaluate(val_loader, device):
-    """Sous-commande evaluate : évalue les modèles sauvegardés + ensemble."""
-    all_model_paths = {
-        name: os.path.join(MODELS_DIR, f"{name}.pth")
-        for name in MODEL_REGISTRY.keys()
-    }
-    available = {n: p for n, p in all_model_paths.items() if os.path.exists(p)}
-
-    if not available:
-        print("\nAucun modèle sauvegardé trouvé dans le dossier models/.")
-        return
-
-    # Évaluation individuelle
-    print(f"\n{'='*50}")
-    print(f"  ÉVALUATION INDIVIDUELLE")
-    print(f"{'='*50}")
-
-    accuracies = {}
-    for name, path in available.items():
-        print(f"\n--- {name.upper()} ---")
-        model = get_model(name, num_classes=NUM_CLASSES).to(device)
-        model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-        result = evaluate_model(model, val_loader, device, model_name=name)
-        accuracies[name] = result["accuracy"]
+        model = get_model(model_name, num_classes=NUM_CLASSES, phase=phase).to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        evaluate_model(model, val_loader, device, model_name=model_name)
         del model
 
-    # Évaluation ensemble
-    if len(available) > 1:
-        _evaluate_ensemble(available, val_loader, device, accuracies)
 
+def cmd_evaluate(model_name, val_loader, device):
+    """Sous-commande evaluate : évalue le modèle sauvegardé."""
+    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
 
-def _evaluate_ensemble(available_models, val_loader, device, accuracies=None):
-    """Évalue l'ensemble des modèles disponibles par weighted soft voting."""
-    import numpy as np
-    from sklearn.metrics import confusion_matrix, classification_report
-    from src.training.evaluate import CLASSES, plot_confusion_matrix, RESULTS_DIR
+    if not os.path.exists(model_path):
+        print(f"\nAucun modèle sauvegardé trouvé : {model_path}")
+        return
 
-    print(f"\n{'='*50}")
-    print(f"  ÉVALUATION DE L'ENSEMBLE (WEIGHTED SOFT VOTING)")
-    print(f"  Modèles : {', '.join(n.upper() for n in available_models)}")
-    print(f"{'='*50}")
+    print(f"\n{'='*60}")
+    print(f"  ÉVALUATION — {model_name.upper()}")
+    print(f"{'='*60}")
 
-    model_configs = [
-        {"name": name, "weights_path": path, "num_classes": NUM_CLASSES}
-        for name, path in available_models.items()
-    ]
-
-    # Poids basés sur l'accuracy individuelle
-    weights = None
-    if accuracies:
-        weights = [accuracies.get(name, 1.0) for name in available_models]
-        total = sum(weights)
-        print(f"  Poids : {', '.join(f'{n}={w/total:.3f}' for n, w in zip(available_models, weights))}")
-
-    ensemble = EnsemblePredictor(model_configs, device, weights=weights)
-    preds, labels = ensemble.evaluate(val_loader)
-
-    preds = np.array(preds)
-    labels = np.array(labels)
-    accuracy = (preds == labels).sum() / len(labels) * 100
-
-    cm = confusion_matrix(labels, preds)
-    report = classification_report(labels, preds, target_names=CLASSES, digits=4)
-
-    print(f"\nPrécision globale de l'ensemble : {accuracy:.2f}%")
-    print(f"\nMatrice de confusion :")
-    print(f"{'':>12}", end="")
-    for c in CLASSES:
-        print(f"{c:>12}", end="")
-    print()
-    for i, row in enumerate(cm):
-        print(f"{CLASSES[i]:>12}", end="")
-        for val in row:
-            print(f"{val:>12}", end="")
-        print()
-    print(f"\n{report}")
-
-    # Heatmap de l'ensemble
-    plot_confusion_matrix(
-        cm, CLASSES,
-        title="Matrice de confusion — ENSEMBLE",
-        save_path=os.path.join(RESULTS_DIR, "confusion_ensemble.png"),
-    )
+    # Phase n'importe pas pour l'évaluation (architecture identique)
+    model = get_model(model_name, num_classes=NUM_CLASSES, phase=1).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    evaluate_model(model, val_loader, device, model_name=model_name)
+    del model
 
 
 def main():
@@ -308,19 +282,58 @@ def main():
 
     if args.command is None:
         print("Usage : python main.py {train,evaluate}")
-        print("  python main.py train --models resnet50 densenet121")
-        print("  python main.py train --models all")
-        print("  python main.py evaluate")
+        print("  python main.py train                    # Phase 1 (Linear Probing)")
+        print("  python main.py train --phase 2          # Phase 2 (Fine-Tuning)")
+        print("  python main.py train --seed 42 123 456  # Multi-seed")
+        print("  python main.py evaluate                 # Évaluation")
         return
 
-    device, train_loader, val_loader, _, _, class_weights = setup()
-
     if args.command == "train":
-        model_names = resolve_model_names(args.models)
-        cmd_train(model_names, train_loader, val_loader, class_weights, device)
+        seeds = args.seed
+        model_name = args.model
+        phase = args.phase
+
+        if len(seeds) == 1:
+            set_seed(seeds[0])
+            device, train_loader, val_loader = setup(seed=seeds[0])
+            cmd_train(model_name, phase, train_loader, val_loader, device)
+        else:
+            # Mode multi-seed : moyenne ± écart-type
+            print(f"\n🔬 Mode multi-seed : {len(seeds)} runs avec seeds {seeds}")
+            all_accs = []
+
+            for i, seed in enumerate(seeds):
+                print(f"\n{'#'*60}")
+                print(f"  RUN {i+1}/{len(seeds)} — SEED {seed}")
+                print(f"{'#'*60}")
+
+                set_seed(seed)
+                device, train_loader, val_loader = setup(seed=seed)
+                cmd_train(model_name, phase, train_loader, val_loader, device)
+
+                # Récupérer l'accuracy pour ce run
+                path = os.path.join(MODELS_DIR, f"{model_name}.pth")
+                if os.path.exists(path):
+                    model = get_model(model_name, num_classes=NUM_CLASSES, phase=phase).to(device)
+                    model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+                    _, val_acc = validate(model, val_loader, nn.CrossEntropyLoss(), device)
+                    all_accs.append(val_acc * 100)
+                    del model
+
+            # Rapport final
+            print(f"\n{'='*60}")
+            print(f"  RAPPORT MULTI-SEED ({len(seeds)} runs)")
+            print(f"{'='*60}")
+            if all_accs:
+                mean = np.mean(all_accs)
+                std = np.std(all_accs)
+                print(f"  {model_name.upper():20s} : {mean:.2f}% ± {std:.2f}%")
+                print(f"  Runs : {[f'{a:.2f}' for a in all_accs]}")
 
     elif args.command == "evaluate":
-        cmd_evaluate(val_loader, device)
+        set_seed(DEFAULT_SEED)
+        device, train_loader, val_loader = setup()
+        cmd_evaluate(args.model, val_loader, device)
 
 
 if __name__ == "__main__":

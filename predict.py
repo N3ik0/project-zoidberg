@@ -1,6 +1,6 @@
 """
-Script de prédiction par ensemble.
-Charge les 3 modèles entraînés et produit un diagnostic combiné.
+Script de prédiction — DenseNet121.
+Charge le modèle entraîné et produit un diagnostic.
 
 Usage :
     # Prédiction sur une seule image
@@ -20,20 +20,22 @@ import random
 import argparse
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from src.data import get_val_transforms, get_tta_transforms
-from src.models import MODEL_REGISTRY, EnsemblePredictor
+from src.models import get_model
 from src.training import CLASSES
 
 MODELS_DIR = "models"
 NUM_CLASSES = 3
+MODEL_NAME = "densenet121"
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Prédiction ensemble sur une ou plusieurs radiographies pulmonaires"
+        description="Prédiction DenseNet121 sur une ou plusieurs radiographies pulmonaires"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--image", help="Chemin vers une image unique")
@@ -95,65 +97,92 @@ def collect_images(dir_path, sample_n=None, seed=42):
     return sorted(images)
 
 
-def find_available_models():
-    """Détecte les modèles entraînés disponibles dans le dossier models/."""
-    available = []
-    for name in MODEL_REGISTRY.keys():
-        path = os.path.join(MODELS_DIR, f"{name}.pth")
-        if os.path.exists(path):
-            available.append({"name": name, "weights_path": path, "num_classes": NUM_CLASSES})
-    return available
+def predict_single(model, image_tensor, device, threshold=0.7):
+    """
+    Prédit la classe d'une image avec un seul modèle.
+
+    Returns:
+        dict avec classe, probas, confiance, fiable
+    """
+    model.eval()
+    image_tensor = image_tensor.to(device)
+
+    with torch.no_grad():
+        output = model(image_tensor)
+        probas = F.softmax(output, dim=1)
+        confiance, classe = torch.max(probas, dim=1)
+
+    return {
+        "classe": classe.item(),
+        "probas": probas.squeeze().cpu().tolist(),
+        "confiance": confiance.item(),
+        "fiable": confiance.item() >= threshold,
+    }
+
+
+def predict_tta(model, image_pil, tta_transforms, device, threshold=0.7):
+    """
+    Prédit avec Test-Time Augmentation : applique N transforms différentes
+    et moyenne les probabilités pour un résultat plus robuste.
+    """
+    import numpy as np
+
+    model.eval()
+    all_probas = []
+
+    with torch.no_grad():
+        for transform in tta_transforms:
+            tensor = transform(image_pil).unsqueeze(0).to(device)
+            output = model(tensor)
+            probas = F.softmax(output, dim=1)
+            all_probas.append(probas.squeeze().cpu().numpy())
+
+    mean_probas = np.mean(all_probas, axis=0)
+    classe = int(np.argmax(mean_probas))
+    confiance = float(mean_probas[classe])
+
+    return {
+        "classe": classe,
+        "probas": mean_probas.tolist(),
+        "confiance": confiance,
+        "fiable": confiance >= threshold,
+        "tta_passes": len(tta_transforms),
+    }
 
 
 def display_single_result(result, image_path=None):
     """Affiche les résultats de la prédiction pour une image."""
-    details = result["details"]
-    num_models = len(details)
-
     print()
     print("╔══════════════════════════════════════╗")
-    print("║        PRÉDICTION ENSEMBLE           ║")
+    print("║        PRÉDICTION DENSENET121        ║")
     print("╚══════════════════════════════════════╝")
 
     if image_path:
         print(f"  Image : {image_path}")
 
     print()
-
-    # Résultats individuels
-    for detail in details:
-        name = detail["name"]
-        classe = CLASSES[detail["classe"]]
-        confiance = detail["confiance"] * 100
-        display_name = name.replace("_", " ").title()
-        print(f"  {display_name:<18} → {classe:<12} (confiance: {confiance:.1f}%)")
-
-    print()
     print("━" * 45)
 
-    # Résultat ensemble
+    # Résultat
     classe_finale = CLASSES[result["classe"]]
     confiance_finale = result["confiance"] * 100
 
-    print(f"  DIAGNOSTIC FINAL : {classe_finale}")
-    print(f"  Confiance        : {confiance_finale:.2f}%")
-
-    consensus = sum(1 for d in details if d["classe"] == result["classe"])
-    if consensus == num_models:
-        print(f"  Consensus        : {consensus}/{num_models} modèles concordent ✅")
-    else:
-        print(f"  Consensus        : {consensus}/{num_models} modèles concordent ⚠️")
+    print(f"  DIAGNOSTIC    : {classe_finale}")
+    print(f"  Confiance     : {confiance_finale:.2f}%")
 
     if result["fiable"]:
-        print(f"  Fiabilité        : FIABLE ✅")
+        print(f"  Fiabilité     : FIABLE ✅")
     else:
-        print(f"  Fiabilité        : À REVOIR ⚠️  (confiance < seuil)")
+        print(f"  Fiabilité     : À REVOIR ⚠️  (confiance < seuil)")
+
+    if "tta_passes" in result:
+        print(f"  TTA           : {result['tta_passes']} passes")
 
     print("━" * 45)
 
     # Barres de probabilités
     print()
-    print("  Probabilités moyennes par classe :")
+    print("  Probabilités par classe :")
     probas = result["probas"]
     for i, classe_name in enumerate(CLASSES):
         bar_len = int(probas[i] * 30)
@@ -163,25 +192,22 @@ def display_single_result(result, image_path=None):
     print()
 
 
-def display_batch_results(results):
+def display_batch_results(results, threshold=0.7):
     """Affiche un tableau récapitulatif pour un batch de prédictions."""
-    num_models = len(results[0]["result"]["details"])
-
     print()
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║                  PRÉDICTION BATCH — ENSEMBLE                   ║")
+    print("║                  PRÉDICTION BATCH — DENSENET121                ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
     print(f"  {len(results)} images analysées\n")
 
     # En-tête du tableau
-    header = f"  {'#':<4} {'Image':<35} {'Diagnostic':<12} {'Conf.':<8} {'Cons.':<7} {'Fiable'}"
+    header = f"  {'#':<4} {'Image':<35} {'Diagnostic':<12} {'Conf.':<8} {'Fiable'}"
     print(header)
-    print("  " + "─" * 75)
+    print("  " + "─" * 65)
 
     # Statistiques globales
     class_counts = {c: 0 for c in CLASSES}
     fiable_count = 0
-    consensus_total = 0
 
     for i, entry in enumerate(results, 1):
         result = entry["result"]
@@ -191,27 +217,23 @@ def display_batch_results(results):
 
         classe = CLASSES[result["classe"]]
         confiance = result["confiance"] * 100
-        consensus = sum(1 for d in result["details"] if d["classe"] == result["classe"])
         fiable = result["fiable"]
 
         class_counts[classe] += 1
         if fiable:
             fiable_count += 1
-        consensus_total += consensus
 
-        cons_str = f"{consensus}/{num_models}"
         fiable_str = "✅" if fiable else "⚠️"
 
-        print(f"  {i:<4} {image_name:<35} {classe:<12} {confiance:>5.1f}%  {cons_str:<7} {fiable_str}")
+        print(f"  {i:<4} {image_name:<35} {classe:<12} {confiance:>5.1f}%  {fiable_str}")
 
     # Résumé
     total = len(results)
-    avg_consensus = consensus_total / total if total > 0 else 0
 
     print()
-    print("  " + "═" * 75)
+    print("  " + "═" * 65)
     print(f"  RÉSUMÉ")
-    print(f"  " + "─" * 75)
+    print("  " + "─" * 65)
 
     for classe_name, count in class_counts.items():
         pct = count / total * 100 if total > 0 else 0
@@ -221,7 +243,6 @@ def display_batch_results(results):
 
     print()
     print(f"  Fiabilité globale  : {fiable_count}/{total} images fiables ({fiable_count/total*100:.1f}%)")
-    print(f"  Consensus moyen    : {avg_consensus:.1f}/{num_models} modèles")
     print()
 
 
@@ -231,16 +252,17 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
 
-    # Détection des modèles
-    model_configs = find_available_models()
-    if not model_configs:
-        print("\n❌ Aucun modèle entraîné trouvé dans le dossier models/.")
-        print("   Lancez d'abord : python main.py train --models all")
+    # Chargement du modèle
+    model_path = os.path.join(MODELS_DIR, f"{MODEL_NAME}.pth")
+    if not os.path.exists(model_path):
+        print(f"\n❌ Modèle introuvable : {model_path}")
+        print("   Lancez d'abord : python main.py train --phase 1")
         return
 
-    print(f"Modèles chargés : {', '.join(c['name'] for c in model_configs)}")
-
-    ensemble = EnsemblePredictor(model_configs, device, confidence_threshold=args.threshold)
+    model = get_model(MODEL_NAME, num_classes=NUM_CLASSES, phase=1).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
+    print(f"Modèle chargé : {MODEL_NAME}")
 
     # --- Mode image unique ---
     if args.image:
@@ -253,10 +275,10 @@ def main():
             print(f"TTA    : {args.tta} passes")
             image_pil = Image.open(args.image).convert("RGB")
             tta_transforms = get_tta_transforms(args.tta)
-            result = ensemble.predict_tta(image_pil, tta_transforms)
+            result = predict_tta(model, image_pil, tta_transforms, device, args.threshold)
         else:
             image_tensor = load_image(args.image)
-            result = ensemble.predict(image_tensor)
+            result = predict_single(model, image_tensor, device, args.threshold)
 
         display_single_result(result, args.image)
 
@@ -273,13 +295,13 @@ def main():
             if args.tta > 1:
                 image_pil = Image.open(str(img_path)).convert("RGB")
                 tta_transforms = get_tta_transforms(args.tta)
-                result = ensemble.predict_tta(image_pil, tta_transforms)
+                result = predict_tta(model, image_pil, tta_transforms, device, args.threshold)
             else:
                 image_tensor = load_image(str(img_path))
-                result = ensemble.predict(image_tensor)
+                result = predict_single(model, image_tensor, device, args.threshold)
             results.append({"path": str(img_path), "result": result})
 
-        display_batch_results(results)
+        display_batch_results(results, args.threshold)
 
 
 if __name__ == "__main__":

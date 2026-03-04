@@ -1,3 +1,2 @@
-# Models sub-package : définitions de modèles et ensemble.
-from src.models.registry import get_model, MODEL_REGISTRY
-from src.models.ensemble import EnsemblePredictor
+# Models sub-package : DenseNet121 avec entraînement 2-phases.
+from src.models.registry import get_model
