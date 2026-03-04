@@ -65,8 +65,8 @@ def _build_resnet50(num_classes):
         param.requires_grad = False
         
     # Dégeler le dernier bloc (layer4)
-    for param in model.layer4.parameters():
-        param.requires_grad = True
+    for param in model.layer4[-1].parameters():
+        param.require_grad = True
 
     # Remplacement de la couche fc
     num_ftrs = model.fc.in_features

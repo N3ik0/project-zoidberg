@@ -139,7 +139,7 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            use_mixup=True, mixup_alpha=MIXUP_ALPHA,
+            use_mixup=False, mixup_alpha=MIXUP_ALPHA,
             grad_accum_steps=GRAD_ACCUM_STEPS,
             scheduler=scheduler
         )
@@ -147,10 +147,12 @@ def train_single_model(name, train_loader, val_loader, class_weights, device):
 
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             torch.save(model.state_dict(), model_path)
             print(f"  🌟 Nouveau record ! Sauvegardé dans {model_path}")
+
 
         early_stopper(val_loss)
         if early_stopper.early_stop:
